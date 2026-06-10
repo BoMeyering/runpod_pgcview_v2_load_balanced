@@ -9,7 +9,8 @@ from pydantic import BaseModel
 # Define request models
 class InferenceRequest(BaseModel):
     b64_str: str # a base64 encoded .png image of shape (3, 1024, 1024)
-
+    conf: float = 0.85 # confidence threshold for filtering bboxes; only used in /infer endpoint
+    
 class InferenceResponse(BaseModel):
     output_map: str # A base64 encoded .png binary output map
     bboxes: str # A base64 encoded array of filtered bounding boxes
