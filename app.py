@@ -33,7 +33,7 @@ request_count = 0
 # Load models at startup
 try:
     segformer_inference = SegformerInference(SEGFORMER_MODEL_PATH)
-    efficientdet_inference = EfficientDetInference(EFFICIENTDET_MODEL_PATH)
+    # efficientdet_inference = EfficientDetInference(EFFICIENTDET_MODEL_PATH)
     logger.info("Models loaded successfully.")
 except Exception as e:
     logger.error(f"Failed to load models: {e}")
@@ -50,7 +50,7 @@ async def infer(request: InferenceRequest, conf: float = Query(0.85, ge=0.0, le=
     
     img = preprocess(request)
     segmentation_results = segformer_inference.run(img)
-    detection_results = efficientdet_inference.run(img)
+    # detection_results = efficientdet_inference.run(img)
     
     return InferenceResponse(
         output_map=segmentation_results,
@@ -61,12 +61,12 @@ async def infer(request: InferenceRequest, conf: float = Query(0.85, ge=0.0, le=
 async def raw_infer(request: InferenceRequest, conf: float = Query(0.85, ge=0.0, le=1.0)):
     img = preprocess(request)
     segmentation_results = segformer_inference.run(img)
-    detection_results = efficientdet_inference.run(img)
+    # detection_results = efficientdet_inference.run(img)
     
-    return RawInferenceResponse(
-        logits=segmentation_results,
-        bboxes=detection_results
-    )
+    # return RawInferenceResponse(
+    #     logits=segmentation_results,
+    #     bboxes=detection_results
+    # )
 
 # A simple endpoint to show request stats
 @app.get("/stats")
