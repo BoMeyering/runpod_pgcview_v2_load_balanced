@@ -17,6 +17,11 @@ COPY onnx/ ./onnx/
 
 COPY src/ ./src/
 
+COPY .env .env
+
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
+
 # Start the handler
-CMD ["python3", "app.py"]
+CMD ["./entrypoint.sh"]
 

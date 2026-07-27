@@ -6,7 +6,9 @@ BoMeyering 2026
 
 import os
 import json
+import uvicorn
 import numpy as np
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from logging import getLogger
 from fastapi import FastAPI, HTTPException, Query
@@ -37,7 +39,7 @@ from src.utils import (
 logger = getLogger()
 
 load_dotenv()
-PORT = os.getenv("PORT", 8080)
+PORT = int(os.getenv("PORT", 80))
 MODEL_IMAGE_SIZE = int(os.getenv("MODEL_IMAGE_SIZE", 1024))
 SEGFORMER_MODEL_PATH = os.getenv("SEGFORMER_MODEL_PATH", "onnx/segformer_enb3_pgcviewv2.onnx")
 EFFICIENTDET_MODEL_PATH = os.getenv("EFFICIENTDET_MODEL_PATH", "onnx/effdet_d2_epoch10_pgcviewv2.onnx")
@@ -73,23 +75,32 @@ QUADRAT_CLASS_ID = CLASS_MAPPING["effdet"]["quadrat_corner"]["class_idx"]
 SEGFORMER_MARKER_CLASS_IDX  = int(os.getenv("SEGFORMER_MARKER_CLASS_IDX",  "-1"))
 SEGFORMER_QUADRAT_CLASS_IDX = int(os.getenv("SEGFORMER_QUADRAT_CLASS_IDX", "-1"))
 
-app = FastAPI()
-
-global request_count
+segformer_inference = None
+efficientdet_inference = None
 request_count = 0
 
-try:
-    segformer_inference = SegformerInference(SEGFORMER_MODEL_PATH)
-    efficientdet_inference = EfficientDetInference(EFFICIENTDET_MODEL_PATH)
-    logger.info("Models loaded successfully.")
-except Exception as e:
-    logger.error(f"Failed to load models: {e}")
-    raise RuntimeError(f"Model loading failed: {e}")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global segformer_inference, efficientdet_inference
+    try:
+        segformer_inference = SegformerInference(SEGFORMER_MODEL_PATH)
+        efficientdet_inference = EfficientDetInference(EFFICIENTDET_MODEL_PATH)
+        logger.info("Models loaded successfully.")
+    except Exception as e:
+        logger.error(f"Failed to load models: {e}")
+        raise RuntimeError(f"Model loading failed: {e}")
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 #--------Endpoints---------#
 @app.get("/health", response_model=HealthCheckResponse)
 async def health_check():
     return {"status": "healthy"}
+
+@app.get("/ping")
+async def ping():
+    return {"status": "ok"}
 
 @app.get("/stats")
 async def stats():
@@ -144,6 +155,8 @@ async def full_pipeline(
          warped ROI and return as a vector.
     """
     global request_count
+
+    print(f"Received request #{request_count + 1}: conf={conf}, marker_type={marker_type}, logits={logits}, bboxes={bboxes}, output_map={output_map}")
 
     img, orig_size = preprocess(request)
     seg_raw = segformer_inference.run(img)
@@ -315,7 +328,5 @@ async def full_pipeline(
 
 
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 80))
-    logger.info(f"Starting PGCView v2 server on port {port}")
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
+    logger.info(f"Starting PGCView v2 server on port {PORT}")
+    uvicorn.run("app:app", host="0.0.0.0", port=PORT)

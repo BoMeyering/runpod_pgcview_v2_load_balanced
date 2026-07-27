@@ -29,7 +29,7 @@ class ModelInference(ABC):
     def __init__(self, model_path: str):
         self.session = InferenceSession(
             model_path,
-            providers=["CPUExecutionProvider"]
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
         )
 
     @abstractmethod

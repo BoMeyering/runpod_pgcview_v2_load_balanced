@@ -3,7 +3,9 @@ effdet
 fastapi
 networkx
 numpy
-onnxruntime
+nvidia-cublas-cu12==12.8.4.1
+nvidia-cudnn-cu12==9.10.2.21
+onnxruntime-gpu
 opencv-python-headless
 pydantic
 pydantic_core
@@ -11,8 +13,8 @@ scipy
 setuptools
 starlette
 sympy
-torch
-torchvision
+torch==2.9.1
+torchvision==0.24.1
 triton
 typing-inspection
 typing_extensions
