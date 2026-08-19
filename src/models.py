@@ -71,8 +71,16 @@ class FullPipelineResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# /health
+# Metadata Responses
 # ---------------------------------------------------------------------------
 
-class HealthCheckResponse(BaseModel):
+class ApiInfoResponse(BaseModel):
+    server_ip: str
+    api_name: str
+    version: str
+    developer: str
+    endpoint_list: list[str]
+    status: str
+
+class PingResponse(BaseModel):
     status: str

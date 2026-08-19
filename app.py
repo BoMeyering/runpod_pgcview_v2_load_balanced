@@ -1,9 +1,12 @@
 """
 app.py
-Main application file
+PGCView_v2 main application file
 BoMeyering 2026
+Oxbow Solutions, LLC.
+Built for The Land Institute
 """
 
+#----------------Imports-----------------#
 import os
 import json
 import uvicorn
@@ -18,7 +21,7 @@ from src.models import (
     DetectionData,
     FullPipelineMetadata,
     FullPipelineResponse,
-    HealthCheckResponse,
+    ApiInfoResponse,
     InferenceRequest,
     RawInferenceData,
     RawInferenceResponse,
@@ -36,8 +39,10 @@ from src.utils import (
     _scale_dets
 )
 
+# Setup logging
 logger = getLogger()
 
+#-----------------Envidronment Variables---------------#
 load_dotenv()
 PORT = int(os.getenv("PORT", 80))
 MODEL_IMAGE_SIZE = int(os.getenv("MODEL_IMAGE_SIZE", 1024))
@@ -55,11 +60,12 @@ SEGFORMER_CLASS_NAMES: list[str] = [
     )
 ]
 
+# Reverse map the class mapping for segformer
 # pixel value -> class name (for segmentation map interpretation)
 PIXEL_CLASS_MAP: dict[int, str] = {
     v["class_idx"]: k for k, v in CLASS_MAPPING["segformer"].items()
 }
-
+# Reverse map the class mapping for the EfficientDet
 # bbox class id -> class name (effdet is 1-indexed in detections)
 BBOX_CLASS_MAP: dict[int, str] = {
     v["class_idx"]: k for k, v in CLASS_MAPPING["effdet"].items()
@@ -72,31 +78,78 @@ QUADRAT_CLASS_ID = CLASS_MAPPING["effdet"]["quadrat_corner"]["class_idx"]
 # Segformer class indices for the objects used in ROI recovery.
 # Set these to match your model's training class ordering.
 # -1 disables recovery for that type (early-return with warning instead).
-SEGFORMER_MARKER_CLASS_IDX  = int(os.getenv("SEGFORMER_MARKER_CLASS_IDX",  "-1"))
-SEGFORMER_QUADRAT_CLASS_IDX = int(os.getenv("SEGFORMER_QUADRAT_CLASS_IDX", "-1"))
+SEGFORMER_MARKER_CLASS_ID = CLASS_MAPPING["segformer"].get("marker", "-1")["class_idx"]
+SEGFORMER_MARKER_CLASS_ID = CLASS_MAPPING["segformer"].get("quadrat", "-1")["class_idx"]
+# SEGFORMER_MARKER_CLASS_IDX  = int(os.getenv("SEGFORMER_MARKER_CLASS_IDX",  "-1"))
+# SEGFORMER_QUADRAT_CLASS_IDX = int(os.getenv("SEGFORMER_QUADRAT_CLASS_IDX", "-1"))
 
 segformer_inference = None
 efficientdet_inference = None
 request_count = 0
 
+#--------------------API Lifespan Event---------------------#
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    Define a lifespan event to load the models at the beginning
+    of the container startup so that the app can begin 
+    processing requests as they come in.
+
+    Parameters:
+    -----------
+    app : FastAPI
+        An initialized FastAPI application
+    """
     global segformer_inference, efficientdet_inference
     try:
         segformer_inference = SegformerInference(SEGFORMER_MODEL_PATH)
         efficientdet_inference = EfficientDetInference(EFFICIENTDET_MODEL_PATH)
         logger.info("Models loaded successfully.")
+
+        # Run a dummy inference through each model so CUDAExecutionProvider's
+        # first-call overhead (CUDA context init, cuDNN algorithm autotuning)
+        # is paid here instead of on the first real request.
+        dummy_img = np.zeros((1, 3, MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE), dtype=np.float32)
+        segformer_inference.run(dummy_img)
+        efficientdet_inference.run(dummy_img)
+        logger.info("Model warm-up complete.")
     except Exception as e:
         logger.error(f"Failed to load models: {e}")
         raise RuntimeError(f"Model loading failed: {e}")
     yield
 
+# Build the application with the lifespan event
 app = FastAPI(lifespan=lifespan)
 
+def list_endpoints(app: FastAPI):
+    """
+    List all defined endpoints and HTTP methods in the application
+    """
+
+    routes = {}
+
+    for route in app.routes:
+        # Extract HTTP methods (e.g., GET, POST)
+        routes[route.path] = {
+            'name': route.name,
+            'methods': route.methods
+        }
+
+    return routes
+
 #--------Endpoints---------#
-@app.get("/health", response_model=HealthCheckResponse)
-async def health_check():
-    return {"status": "healthy"}
+@app.get("/api_info", response_model=ApiInfoResponse)
+async def api_info():
+    """ General API information endpoint """
+
+    return {
+        'server_ip': '0.0.0.0',
+        'api_name': 'pgcview_api',
+        'version': VERSION,
+        'developer': 'BoMeyering',
+        'endpoint_list': [],
+        'status': 'actively_maintained'
+    }
 
 @app.get("/ping")
 async def ping():

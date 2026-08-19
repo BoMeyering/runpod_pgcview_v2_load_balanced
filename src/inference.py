@@ -46,14 +46,24 @@ class ModelInference(ABC):
 
 
 class SegformerInference(ModelInference):
-    def __init__(self, model_path: str):
+    def __init__(
+            self, 
+            model_path: str
+        ):
         super().__init__(model_path)
 
-    def preprocess(self, img: np.ndarray) -> np.ndarray:
+    def preprocess(
+            self, 
+            img: np.ndarray
+        ) -> np.ndarray:
         # Image is already normalized and batched by utils.preprocess(); pass through.
         return img
 
-    def postprocess(self, outputs, target_size: Optional[tuple[int, int]] = None) -> np.ndarray:
+    def postprocess(
+            self, 
+            outputs, 
+            target_size: Optional[tuple[int, int]] = None
+        ) -> np.ndarray:
         """Interpolate logits to target_size and return a uint8 argmax class map [H, W].
 
         Upsampling is done on the raw logits (before argmax) via bilinear
@@ -61,11 +71,15 @@ class SegformerInference(ModelInference):
         more faithful to the continuous probability surface than nearest-neighbour
         upsampling of a discrete class map would be.
 
-        Args:
-            outputs:     Raw ONNX output list; first element is [1, C, H', W'].
-            target_size: (H, W) to interpolate to.  Defaults to MODEL_IMAGE_SIZE².
+        Parameters:
+        -----------
+        outputs : torch.Tensor
+            Raw ONNX output list; first element is [1, C, H', W'].
+        target_size : Tuple
+            (H, W) to interpolate to. Defaults to MODEL_IMAGE_SIZE^2.
         """
         raw = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
+
         logits = torch.from_numpy(raw).float()  # [1, C, H', W'] or [C, H', W']
         if logits.dim() == 3:
             logits = logits.unsqueeze(0)
@@ -91,17 +105,28 @@ class SegformerInference(ModelInference):
 
 
 class EfficientDetInference(ModelInference):
-    def __init__(self, model_path: str, max_det: int = 100, nms_iou: float = 0.5, score_threshold: float = 0.85):
+    def __init__(
+            self, 
+            model_path: str, 
+            max_det: int = 100, 
+            nms_iou: float = 0.5, 
+            score_threshold: float = 0.85
+        ):
         super().__init__(model_path)
         self.max_det = max_det
         self.nms_iou = nms_iou
         self.score_threshold = score_threshold
 
     def preprocess(self, img: np.ndarray) -> np.ndarray:
+        """ Preprocess a single image """
         # Image is already normalized and batched by utils.preprocess(); pass through.
         return img
 
-    def postprocess(self, outputs, score_threshold: Optional[float] = None) -> np.ndarray:
+    def postprocess(
+            self, 
+            outputs, 
+            score_threshold: Optional[float] = None
+        ) -> np.ndarray:
         """Decode ONNX outputs to an [N, 6] float32 array of [x1, y1, x2, y2, score, class].
 
         Rows with class == 0 (zero-padded empties) are stripped. Class is 1-indexed.
