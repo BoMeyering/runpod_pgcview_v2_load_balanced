@@ -79,9 +79,7 @@ QUADRAT_CLASS_ID = CLASS_MAPPING["effdet"]["quadrat_corner"]["class_idx"]
 # Set these to match your model's training class ordering.
 # -1 disables recovery for that type (early-return with warning instead).
 SEGFORMER_MARKER_CLASS_ID = CLASS_MAPPING["segformer"].get("marker", "-1")["class_idx"]
-SEGFORMER_MARKER_CLASS_ID = CLASS_MAPPING["segformer"].get("quadrat", "-1")["class_idx"]
-# SEGFORMER_MARKER_CLASS_IDX  = int(os.getenv("SEGFORMER_MARKER_CLASS_IDX",  "-1"))
-# SEGFORMER_QUADRAT_CLASS_IDX = int(os.getenv("SEGFORMER_QUADRAT_CLASS_IDX", "-1"))
+SEGFORMER_QUADRAT_CLASS_ID = CLASS_MAPPING["segformer"].get("quadrat", "-1")["class_idx"]
 
 segformer_inference = None
 efficientdet_inference = None
@@ -315,13 +313,13 @@ async def full_pipeline(
     if n_missing > 0:
         if image_type == "marker":
             recovered = find_marker_midpoints_from_mask(
-                class_map, SEGFORMER_MARKER_CLASS_IDX,
+                class_map, SEGFORMER_MARKER_CLASS_ID,
                 detected_midpoints, n_missing,
                 detected_bboxes=top4[:, :4],
             )
         else:
             recovered = find_quadrat_corners_from_mask(
-                class_map, SEGFORMER_QUADRAT_CLASS_IDX,
+                class_map, SEGFORMER_QUADRAT_CLASS_ID,
                 n_missing,
                 detected_bboxes=top4[:, :4],
             )
