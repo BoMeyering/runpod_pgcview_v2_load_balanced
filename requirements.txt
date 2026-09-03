@@ -3,9 +3,7 @@ effdet
 fastapi
 networkx
 numpy
-nvidia-cublas-cu12==12.8.4.1
-nvidia-cudnn-cu12==9.10.2.21
-onnxruntime-gpu
+onnxruntime-gpu==1.22.0
 opencv-python-headless
 pydantic
 pydantic_core
@@ -13,9 +11,8 @@ scipy
 setuptools
 starlette
 sympy
-torch==2.9.1
-torchvision==0.24.1
-triton
+# torch / torchvision (and the matching triton) are installed separately from
+# the cu128 index in the Dockerfile so their bundled CUDA/cuDNN target Blackwell.
 typing-inspection
 typing_extensions
 uvicorn

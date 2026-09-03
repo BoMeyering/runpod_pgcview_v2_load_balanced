@@ -6,13 +6,21 @@ Oxbow Solutions, LLC
 """
 
 import os
+import logging
 from typing import Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
 from abc import ABC, abstractmethod
+import onnxruntime
 from onnxruntime import InferenceSession
 from fastapi import HTTPException
+
+logger = logging.getLogger(__name__)
+
+# Fail loudly if the GPU provider can't load, instead of silently running on CPU.
+# Set REQUIRE_CUDA=0 to allow CPU fallback (e.g. local dev without a GPU).
+REQUIRE_CUDA = os.getenv("REQUIRE_CUDA", "1") not in ("0", "false", "False", "")
 
 from .utils import b64_to_image
 from .postprocess import get_anchor_boxes, postprocess_detections
@@ -27,10 +35,27 @@ MODEL_IMAGE_SIZE = int(os.getenv("MODEL_IMAGE_SIZE", 1024))
 class ModelInference(ABC):
     @abstractmethod
     def __init__(self, model_path: str):
-        self.session = InferenceSession(
-            model_path,
-            providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
-        )
+        requested = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        available = onnxruntime.get_available_providers()
+        if "CUDAExecutionProvider" not in available and REQUIRE_CUDA:
+            raise RuntimeError(
+                "CUDAExecutionProvider is not available to onnxruntime. "
+                f"Available providers: {available}. "
+                "Check that onnxruntime-gpu (not onnxruntime) is installed and that "
+                "libcudart/libcublas/libcudnn/libcufft/libcurand/libnvrtc are on "
+                "LD_LIBRARY_PATH. Set REQUIRE_CUDA=0 to allow CPU fallback."
+            )
+
+        self.session = InferenceSession(model_path, providers=requested)
+
+        active = self.session.get_providers()
+        logger.info("ONNX session for %s using providers: %s", model_path, active)
+        if "CUDAExecutionProvider" not in active and REQUIRE_CUDA:
+            raise RuntimeError(
+                f"ONNX session for {model_path} fell back to CPU (active providers: "
+                f"{active}). Run with onnxruntime logging severity 0 to see the CUDA "
+                "provider load error. Set REQUIRE_CUDA=0 to allow CPU fallback."
+            )
 
     @abstractmethod
     def preprocess(self, img: np.ndarray) -> np.ndarray:
