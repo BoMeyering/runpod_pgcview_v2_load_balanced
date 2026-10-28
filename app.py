@@ -31,10 +31,13 @@ from src.inference import SegformerInference, EfficientDetInference
 from src.utils import (
     array_to_b64,
     compute_class_proportions,
+    compute_grass_activity_fractions,
     find_marker_midpoints_from_mask,
     find_quadrat_corners_from_mask,
     grayscale_image_to_b64,
+    impute_missing_marker,
     preprocess,
+    warp_color_to_roi,
     warp_to_roi,
     _scale_dets
 )
@@ -74,6 +77,9 @@ BBOX_CLASS_MAP: dict[int, str] = {
 # EfficientDet classes are 1-indexed in detections.
 MARKER_CLASS_ID  = CLASS_MAPPING["effdet"]["marker"]["class_idx"]
 QUADRAT_CLASS_ID = CLASS_MAPPING["effdet"]["quadrat_corner"]["class_idx"]
+
+# Segformer class index for grass (pgc), used for active/dormant fraction analysis.
+PGC_CLASS_ID = CLASS_MAPPING["segformer"]["pgc"]["class_idx"]
 
 # Segformer class indices for the objects used in ROI recovery.
 # Set these to match your model's training class ordering.
@@ -163,7 +169,7 @@ async def raw_infer(
     conf: float = Query(0.85, ge=0.0, le=1.0),
 ):
     global request_count
-    img, orig_size = preprocess(request)
+    img, orig_size, _raw_img = preprocess(request)
 
     seg_raw = segformer_inference.run(img)
     dets = _scale_dets(efficientdet_inference.run(img, conf), orig_size)
@@ -209,7 +215,7 @@ async def full_pipeline(
 
     print(f"Received request #{request_count + 1}: conf={conf}, marker_type={marker_type}, logits={logits}, bboxes={bboxes}, output_map={output_map}")
 
-    img, orig_size = preprocess(request)
+    img, orig_size, raw_img = preprocess(request)
     seg_raw = segformer_inference.run(img)
     # Scale detections from model space (MODEL_IMAGE_SIZE²) to original image space
     dets = _scale_dets(efficientdet_inference.run(img, conf), orig_size)  # [N, 6]
@@ -221,8 +227,8 @@ async def full_pipeline(
 
     orig_h, orig_w = orig_size
 
-    def _response(image_type, num_det, region_type, roi_bboxes, detection_scores,
-                  num_inferred, inferred_pts, class_proportions,
+    def _response(image_type, num_det, region_type, roi_bboxes, bbox_types, detection_scores,
+                  num_inferred, inferred_pts, num_imputed, imputed_pts, class_proportions, grass_fractions,
                   class_map_arr, dets_arr, seg_raw_arr, warning=None):
         return FullPipelineResponse(
             metadata=FullPipelineMetadata(
@@ -235,14 +241,19 @@ async def full_pipeline(
                 output_map=grayscale_image_to_b64(class_map_arr),
                 pixel_class_map=PIXEL_CLASS_MAP,
                 class_proportions=class_proportions,
+                active_grass_fraction=grass_fractions["active_grass"],
+                dormant_grass_fraction=grass_fractions["dormant_grass"],
             ),
             detection=DetectionData(
                 num_detections=num_det,
                 region_type=region_type,
                 roi_bboxes=roi_bboxes,
+                bbox_types=bbox_types,
                 detection_scores=detection_scores,
                 num_inferred=num_inferred,
                 inferred_points=inferred_pts,
+                num_imputed=num_imputed,
+                imputed_points=imputed_pts,
                 bbox_class_map=BBOX_CLASS_MAP,
             ),
             debug=DebugData(
@@ -255,8 +266,9 @@ async def full_pipeline(
     # --- No detections at all: fall back to class proportions over the full raw image ---
     if dets.shape[0] == 0:
         return _response(
-            "unknown", 0, "full_image", [], [], 0, [],
+            "unknown", 0, "full_image", [], [], [], 0, [], 0, [],
             compute_class_proportions(class_map, SEGFORMER_CLASS_NAMES),
+            compute_grass_activity_fractions(raw_img, class_map, PGC_CLASS_ID),
             class_map, dets, seg_raw,
             warning="No detections above confidence threshold; returning class proportions over the full image.",
         )
@@ -309,71 +321,105 @@ async def full_pipeline(
         detected_midpoints = np.empty((0, 2), dtype=np.float32)
 
     # --- Recover missing positions from the segmentation map ---
-    n_recovered = 0
+    n_seg_recovered = 0
+    geo_imputed = np.empty((0, 2), dtype=np.float32)
     if n_missing > 0:
         if image_type == "marker":
-            recovered = find_marker_midpoints_from_mask(
+            seg_recovered = find_marker_midpoints_from_mask(
                 class_map, SEGFORMER_MARKER_CLASS_ID,
                 detected_midpoints, n_missing,
                 detected_bboxes=top4[:, :4],
             )
         else:
-            recovered = find_quadrat_corners_from_mask(
+            seg_recovered = find_quadrat_corners_from_mask(
                 class_map, SEGFORMER_QUADRAT_CLASS_ID,
                 n_missing,
                 detected_bboxes=top4[:, :4],
             )
 
-        n_recovered = len(recovered)
+        n_seg_recovered = len(seg_recovered)
+
+        # If detection + segmentation recovery together still leave exactly one
+        # position unresolved, geometrically approximate it from the other 3
+        # (parallelogram completion) rather than discarding the ROI outright.
+        # With 2 or fewer known positions there isn't enough geometry to
+        # constrain a guess, so this stays off and the fallback below applies.
+        if n_seg_recovered < n_missing and (n_detected + n_seg_recovered) == 3:
+            known_pts = np.concatenate([detected_midpoints, seg_recovered], axis=0)
+            imputed = impute_missing_marker(known_pts, orig_size)
+            if imputed is not None:
+                geo_imputed = imputed[np.newaxis, :]
+
+        n_recovered = n_seg_recovered + len(geo_imputed)
         if n_recovered < n_missing:
+            recovered_all = np.concatenate([seg_recovered, geo_imputed], axis=0)
             partial_roi_bboxes = top4[:, :4].tolist()
-            partial_roi_bboxes += [[float(cx), float(cy), float(cx), float(cy)] for cx, cy in recovered]
+            partial_roi_bboxes += [[float(cx), float(cy), float(cx), float(cy)] for cx, cy in recovered_all]
+            partial_bbox_types = (
+                ["detected"] * n_detected
+                + ["segmentation_recovered"] * n_seg_recovered
+                + ["geometric_imputed"] * len(geo_imputed)
+            )
             request_count += 1
             return _response(
                 image_type, n_detected, "full_image",
                 partial_roi_bboxes,
+                partial_bbox_types,
                 [float(s) for s in top4[:, 4]],
-                n_recovered,
-                [[float(x), float(y)] for x, y in recovered],
+                n_seg_recovered,
+                [[float(x), float(y)] for x, y in seg_recovered],
+                len(geo_imputed),
+                [[float(x), float(y)] for x, y in geo_imputed],
                 compute_class_proportions(class_map, SEGFORMER_CLASS_NAMES),
+                compute_grass_activity_fractions(raw_img, class_map, PGC_CLASS_ID),
                 class_map, top4, seg_raw,
                 warning=(
                     f"Need 4 '{image_type}' positions; detected {n_detected}, "
-                    f"recovered {n_recovered}/{n_missing} from segmentation mask; "
+                    f"recovered {n_seg_recovered}/{n_missing} from segmentation mask, "
+                    f"{len(geo_imputed)} geometrically imputed; "
                     "returning class proportions over the full image."
                 ),
             )
 
-        midpoints = (
-            np.concatenate([detected_midpoints, recovered], axis=0)
-            if n_detected > 0
-            else recovered
-        )
+        midpoints = np.concatenate([detected_midpoints, seg_recovered, geo_imputed], axis=0)
     else:
         midpoints = detected_midpoints
 
-    # --- Perspective warp of the class map ---
+    # --- Perspective warp of the class map and raw color image ---
     # order_points uses Hungarian matching against image corners to ensure
     # correct TL/TR/BR/BL correspondence for cv2.getPerspectiveTransform.
     warped_class_map = warp_to_roi(class_map, midpoints, MODEL_IMAGE_SIZE)
+    warped_img = warp_color_to_roi(raw_img, midpoints, MODEL_IMAGE_SIZE)
 
-    # --- Compute per-class proportions in the warped ROI ---
+    # --- Compute per-class proportions and grass active/dormant fractions in the warped ROI ---
     proportions = compute_class_proportions(warped_class_map, SEGFORMER_CLASS_NAMES)
+    grass_fractions = compute_grass_activity_fractions(warped_img, warped_class_map, PGC_CLASS_ID)
 
-    inferred_points = midpoints[n_detected:] if n_recovered > 0 else np.empty((0, 2), dtype=np.float32)
+    inferred_points = midpoints[n_detected:n_detected + n_seg_recovered]
+    imputed_points = midpoints[n_detected + n_seg_recovered:]
 
     roi_bboxes = top4[:, :4].tolist()
     roi_bboxes += [[float(cx), float(cy), float(cx), float(cy)] for cx, cy in inferred_points]
+    roi_bboxes += [[float(cx), float(cy), float(cx), float(cy)] for cx, cy in imputed_points]
+    bbox_types = (
+        ["detected"] * n_detected
+        + ["segmentation_recovered"] * n_seg_recovered
+        + ["geometric_imputed"] * len(imputed_points)
+    )
 
     request_count += 1
 
     return _response(
         image_type, n_detected, image_type,
         roi_bboxes,
+        bbox_types,
         [float(s) for s in top4[:, 4]],
-        n_recovered,
+        n_seg_recovered,
         [[float(x), float(y)] for x, y in inferred_points],
+        len(imputed_points),
+        [[float(x), float(y)] for x, y in imputed_points],
         proportions,
+        grass_fractions,
         class_map, top4, seg_raw,
     )
 
