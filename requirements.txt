@@ -12,7 +12,7 @@ setuptools
 starlette
 sympy
 # torch / torchvision (and the matching triton) are installed separately from
-# the cu128 index in the Dockerfile so their bundled CUDA/cuDNN target Blackwell.
+# the cu126 index in the Dockerfile to match this endpoint's Ampere/Ada GPU pool.
 typing-inspection
 typing_extensions
 uvicorn
