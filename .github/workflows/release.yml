@@ -1,0 +1,163 @@
+# Cut a release whenever a PR from another branch is merged into main:
+#   1. Work out the release version from VERSION (bumping it if already released)
+#   2. Commit the bumped VERSION back to main
+#   3. Build the container image and push it to GHCR (vX.Y.Z[-suffix] and latest)
+#   4. Create the tag + GitHub release with notes built from the PR's commits
+#
+# Bump size comes from PR labels: release:major, release:minor, otherwise patch.
+# Label a PR release:skip to merge without releasing.
+# If VERSION was set by hand in the PR to a version with no tag yet, that
+# version is released as-is instead of being bumped.
+
+name: Release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/bomeyering/pgcview-runpod-api
+
+jobs:
+  release:
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !contains(github.event.pull_request.labels.*.name, 'release:skip')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_TITLE: ${{ github.event.pull_request.title }}
+      BUMP: >-
+        ${{ contains(github.event.pull_request.labels.*.name, 'release:major') && 'major'
+        || contains(github.event.pull_request.labels.*.name, 'release:minor') && 'minor'
+        || 'patch' }}
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          lfs: true
+
+      - name: Determine release version
+        id: version
+        run: |
+          CUR=$(tr -d '[:space:]' < VERSION)
+          if [[ ! "$CUR" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::VERSION '$CUR' is not MAJOR.MINOR.PATCH[-suffix]"
+            exit 1
+          fi
+          MAJ=${BASH_REMATCH[1]} MIN=${BASH_REMATCH[2]} PAT=${BASH_REMATCH[3]} SUF=${BASH_REMATCH[4]}
+
+          if git rev-parse -q --verify "refs/tags/v$CUR" >/dev/null; then
+            case "$BUMP" in
+              major) MAJ=$((MAJ+1)); MIN=0; PAT=0 ;;
+              minor) MIN=$((MIN+1)); PAT=0 ;;
+              *)     PAT=$((PAT+1)) ;;
+            esac
+            NEW="$MAJ.$MIN.$PAT$SUF"
+            BUMPED=true
+          else
+            NEW="$CUR"
+            BUMPED=false
+          fi
+
+          if git rev-parse -q --verify "refs/tags/v$NEW" >/dev/null; then
+            echo "::error::Tag v$NEW already exists; set VERSION by hand to an unreleased version"
+            exit 1
+          fi
+
+          PREV_TAG=$(gh release list --limit 1 --exclude-drafts --exclude-pre-releases \
+            --json tagName --jq '.[0].tagName // ""')
+
+          echo "Releasing v$NEW (from VERSION=$CUR, bumped=$BUMPED, bump=$BUMP, previous=$PREV_TAG)"
+          {
+            echo "version=$NEW"
+            echo "bumped=$BUMPED"
+            echo "prev_tag=$PREV_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Commit version bump to main
+        if: steps.version.outputs.bumped == 'true'
+        run: |
+          echo "${{ steps.version.outputs.version }}" > VERSION
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Bump version to ${{ steps.version.outputs.version }}"
+          git push origin HEAD:main
+
+      # The CUDA + torch image is ~10 GB; the runner doesn't have room by default.
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:v${{ steps.version.outputs.version }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Write release notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PREV_TAG: ${{ steps.version.outputs.prev_tag }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          {
+            echo "## What's changed"
+            echo
+            echo "$PR_TITLE (#$PR_NUMBER)"
+            echo
+            echo "### Commits"
+            echo
+            gh api --paginate "repos/${{ github.repository }}/pulls/$PR_NUMBER/commits" \
+              --jq '.[] | select(.commit.message | startswith("Merge ") | not)
+                    | "- \(.commit.message | split("\n")[0]) (\(.sha[0:7]))"'
+            echo
+            echo "### Container image"
+            echo
+            echo '```'
+            echo "$IMAGE:v$VERSION"
+            echo '```'
+            if [ -n "$PREV_TAG" ]; then
+              echo
+              echo "**Full changelog**: $REPO_URL/compare/$PREV_TAG...v$VERSION"
+            fi
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Create GitHub release
+        run: |
+          gh release create "v${{ steps.version.outputs.version }}" \
+            --target "$(git rev-parse HEAD)" \
+            --title "PGCView v${{ steps.version.outputs.version }}" \
+            --notes-file release-notes.md
