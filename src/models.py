@@ -45,15 +45,20 @@ class SegmentationData(BaseModel):
     output_map: str                    # base64 encoded full-image segmentation PNG
     pixel_class_map: dict[int, str]   # pixel value -> class name
     class_proportions: dict[str, float]
+    active_grass_fraction: float = 0.0  # fraction of grass px classified as green (active)
+    dormant_grass_fraction: float = 0.0 # fraction of grass px classified as brown (dormant)
 
 
 class DetectionData(BaseModel):
     num_detections: int
     region_type: Optional[str] = None  # "marker", "quadrat", or "full_image"
-    roi_bboxes: list[list[float]] = [] # [[x1,y1,x2,y2], ...] detected + imputed point-boxes
+    roi_bboxes: list[list[float]] = [] # [[x1,y1,x2,y2], ...] detected + recovered + imputed point-boxes
+    bbox_types: list[str] = []         # parallel to roi_bboxes: "detected", "segmentation_recovered", or "geometric_imputed"
     detection_scores: list[float] = [] # confidence scores of detected bboxes
     num_inferred: int = 0              # positions recovered from segmentation mask
     inferred_points: list[list[float]] = []
+    num_imputed: int = 0                # positions geometrically imputed from the other 3
+    imputed_points: list[list[float]] = []
     bbox_class_map: dict[int, str]    # class id -> class name
 
 

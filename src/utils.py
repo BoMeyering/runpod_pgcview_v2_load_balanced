@@ -23,6 +23,12 @@ MEANS = np.array(os.getenv("MEANS", "0.485,0.456,0.406").split(","), dtype=np.fl
 STD = np.array(os.getenv("STDS", "0.229,0.224,0.225").split(","), dtype=np.float32)
 MODEL_IMAGE_SIZE = int(os.getenv("MODEL_IMAGE_SIZE", 1024))
 
+# OpenCV hue bounds (0-179) for active (green) grass. Every grass-class pixel
+# inside this range is active; all others are dormant. Grass-pixel hues are
+# bimodal (straw ~18-22, green ~38-46) with the valley around 32.
+GRASS_ACTIVE_HUE_LO = 32
+GRASS_ACTIVE_HUE_HI = 115
+
 
 def b64_to_image(b64_str: str) -> np.ndarray:
     """
@@ -139,7 +145,7 @@ def array_to_b64(arr: np.ndarray) -> str:
     return base64.b64encode(arr.tobytes()).decode('utf-8')
 
 
-def preprocess(request: InferenceRequest) -> tuple[np.ndarray, tuple[int, int]]:
+def preprocess(request: InferenceRequest) -> tuple[np.ndarray, tuple[int, int], np.ndarray]:
     """
     Decode, resize, and normalize the base64 image from the inference request.
 
@@ -149,7 +155,7 @@ def preprocess(request: InferenceRequest) -> tuple[np.ndarray, tuple[int, int]]:
     Parameters:
     -----------
     request : InferenceRequest
-        The inference request with keys 'b64_str' and 'metadata'    
+        The inference request with keys 'b64_str' and 'metadata'
 
     Returns:
     --------
@@ -159,6 +165,10 @@ def preprocess(request: InferenceRequest) -> tuple[np.ndarray, tuple[int, int]]:
         A tuple (H, W) of the decoded image before resizing. Use this to
         scale detection coordinates and segmentation maps back to the
         original image space after inference.
+    raw_img : np.ndarray
+        The decoded HWC uint8 image (RGB-ordered, per the client convention) at orig_size, before resizing/normalization.
+        Use this for pixel-level color analysis (e.g. green/brown discrimination)
+        alongside the original-size segmentation class map.
 
     Raises:
     -------
@@ -187,6 +197,7 @@ def preprocess(request: InferenceRequest) -> tuple[np.ndarray, tuple[int, int]]:
         )
 
     orig_size: tuple[int, int] = (img.shape[0], img.shape[1])  # (H, W)
+    raw_img = img
 
     # Image always gets resized to model input if needed
     if img.shape[0] != MODEL_IMAGE_SIZE or img.shape[1] != MODEL_IMAGE_SIZE:
@@ -199,7 +210,7 @@ def preprocess(request: InferenceRequest) -> tuple[np.ndarray, tuple[int, int]]:
             status_code=422,
             detail={"stage": "image_preprocessing", "error": str(e)}
         )
-    return img[np.newaxis, :, :, :], orig_size  # [1, C, H, W], (H, W)
+    return img[np.newaxis, :, :, :], orig_size, raw_img  # [1, C, H, W], (H, W), HWC RGB uint8
 
 
 def order_points(
@@ -246,9 +257,39 @@ def order_points(
     return ordered
 
 
+def _perspective_warp(
+        arr: np.ndarray,
+        src_pts: np.ndarray,
+        output_size: int,
+        interpolation: int,
+    ) -> np.ndarray:
+    """
+    Perspective-warp an array (class map or color image) so that src_pts map
+    to the four corners of a square output_size x output_size canvas.
+    """
+    ordered = order_points(src_pts, output_size)
+    dst = np.array(
+        [
+            [0, 0],
+            [output_size-1, 0],
+            [output_size-1, output_size-1],
+            [0, output_size-1],
+        ],
+        dtype=np.float32
+    )
+    M = cv2.getPerspectiveTransform(ordered, dst)
+
+    return cv2.warpPerspective(
+        arr,
+        M,
+        (output_size, output_size),
+        flags=interpolation
+    )
+
+
 def warp_to_roi(
-        class_map: np.ndarray, 
-        src_pts: np.ndarray, 
+        class_map: np.ndarray,
+        src_pts: np.ndarray,
         output_size: int = 1024
     ) -> np.ndarray:
     """
@@ -268,26 +309,35 @@ def warp_to_roi(
     warped : np.ndarray
         Warped class map of shape (output_size, output_size) uint8.
     """
-    ordered = order_points(src_pts, output_size)
-    dst = np.array(
-        [
-            [0, 0],
-            [output_size-1, 0],
-            [output_size-1, output_size-1],
-            [0, output_size-1],
-        ], 
-        dtype=np.float32
-    )
-    M = cv2.getPerspectiveTransform(ordered, dst)
+    return _perspective_warp(class_map.astype(np.uint8), src_pts, output_size, cv2.INTER_NEAREST)
 
-    warped = cv2.warpPerspective(
-        class_map.astype(np.uint8),
-        M,
-        (output_size, output_size),
-        flags=cv2.INTER_NEAREST
-    )
 
-    return warped
+def warp_color_to_roi(
+        img: np.ndarray,
+        src_pts: np.ndarray,
+        output_size: int = 1024
+    ) -> np.ndarray:
+    """
+    Perspective-warp an HWC color image so that src_pts map to the four corners.
+
+    Uses the same corner-matching logic as warp_to_roi, so passing the same
+    src_pts warps a color image and a class map into pixel-aligned ROIs.
+
+    Parameters:
+    -----------
+    img : np.ndarray
+        HWC BGR uint8 image.
+    src_pts : np.ndarray
+        (4, 2) float32 array of (x, y) midpoints in image space.
+    output_size : int
+        Integer side length of the square output canvas (default 1024).
+
+    Returns:
+    --------
+    warped : np.ndarray
+        Warped color image of shape (output_size, output_size, 3) uint8.
+    """
+    return _perspective_warp(img, src_pts, output_size, cv2.INTER_LINEAR)
 
 
 def compute_class_proportions(
@@ -318,6 +368,60 @@ def compute_class_proportions(
     return {
         name: round(float(np.sum(class_map == idx)) / total, 4)
         for idx, name in enumerate(class_names)
+    }
+
+
+def compute_grass_activity_fractions(
+        color_img: np.ndarray,
+        class_map: np.ndarray,
+        grass_cls_idx: int,
+        active_hue_lo: int = GRASS_ACTIVE_HUE_LO,
+        active_hue_hi: int = GRASS_ACTIVE_HUE_HI,
+    ) -> dict:
+    """
+    Split grass-class pixels into active (green) vs dormant (brown) fractions.
+
+    Every pixel the segmentation model classified as grass is assigned to
+    exactly one of the two classes by its HSV hue: hues in
+    [active_hue_lo, active_hue_hi] are active, everything else (tan/straw,
+    brown, red) is dormant. The two fractions therefore always sum to 1.0
+    over the full grass mask, not of the whole ROI.
+
+    Parameters:
+    -----------
+    color_img : np.ndarray
+        HWC RGB uint8 image (as returned by preprocess), same H, W as class_map.
+    class_map : np.ndarray
+        HW uint8 array of class indices, same H, W as color_img.
+    grass_cls_idx : int
+        Class index in class_map representing grass.
+    active_hue_lo, active_hue_hi : int
+        Inclusive OpenCV hue bounds (0-179) for active grass.
+
+    Returns:
+    --------
+    dict with keys 'active_grass' and 'dormant_grass', each a proportion
+    (0.0-1.0) rounded to 4 decimal places. Both are 0.0 if there are no
+    grass pixels.
+    """
+    grass_mask = class_map == grass_cls_idx
+    grass_px = int(np.count_nonzero(grass_mask))
+
+    if grass_px == 0:
+        return {"active_grass": 0.0, "dormant_grass": 0.0}
+
+    # Clients send channel-swapped images so the decoded array is RGB-ordered for
+    # the models. Converting with BGR2HSV instead would turn tan/brown pixels into
+    # blue-ish hues inside the active range.
+    hue = cv2.cvtColor(color_img, cv2.COLOR_RGB2HSV)[:, :, 0]
+    active_px = int(np.count_nonzero(
+        (hue >= active_hue_lo) & (hue <= active_hue_hi) & grass_mask
+    ))
+    active = round(active_px / grass_px, 4)
+
+    return {
+        "active_grass": active,
+        "dormant_grass": round(1.0 - active, 4),
     }
 
 
@@ -382,6 +486,114 @@ def _rects_covered_by_bboxes(
     return (overlap_ratio >= overlap_thresh).any(axis=1)
 
 
+def _canonical_corners(image_shape: tuple[int, int]) -> np.ndarray:
+    """
+    Return the 4 canonical image corners in [TL, TR, BR, BL] order.
+
+    Parameters:
+    -----------
+    image_shape : tuple[int, int]
+        (H, W) of the image the corners are defined in.
+
+    Returns:
+    --------
+    np.ndarray : (4, 2) float32 array of (x, y) corners [TL, TR, BR, BL].
+    """
+    h, w = image_shape
+    return np.array(
+        [[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]],
+        dtype=np.float32,
+    )
+
+
+def _match_points_to_corners(
+        points: np.ndarray,
+        corners: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Hungarian-match up to len(corners) points to their nearest distinct corner.
+
+    Parameters:
+    -----------
+    points : np.ndarray
+        (N, 2) float32 array of points, N <= len(corners).
+    corners : np.ndarray
+        (4, 2) float32 array of canonical corner positions [TL, TR, BR, BL].
+
+    Returns:
+    --------
+    point_corner_idx : np.ndarray
+        (N,) int array; point_corner_idx[i] is the corner index (0-3) assigned
+        to points[i].
+    open_corner_idx : np.ndarray
+        Sorted int array of corner indices with no point assigned to them.
+    """
+    if len(points) == 0:
+        return np.empty((0,), dtype=int), np.arange(len(corners))
+
+    cost = cdist(points, corners)
+    row_idx, col_idx = linear_sum_assignment(cost)
+
+    point_corner_idx = np.full(len(points), -1, dtype=int)
+    point_corner_idx[row_idx] = col_idx
+    open_corner_idx = np.array(
+        [i for i in range(len(corners)) if i not in col_idx], dtype=int
+    )
+    return point_corner_idx, open_corner_idx
+
+
+def impute_missing_marker(
+        known_points: np.ndarray,
+        image_shape: tuple[int, int],
+    ) -> np.ndarray | None:
+    """
+    Geometrically approximate a 4th corner position from 3 known ones.
+
+    Matches the 3 known points to the image's canonical corners (TL, TR, BR,
+    BL) via Hungarian assignment, then completes the missing corner under a
+    parallelogram assumption: opposite corners share a diagonal midpoint
+    (p_TL + p_BR == p_TR + p_BL), so the missing corner equals the sum of its
+    two neighboring corners minus the corner diagonally opposite it.
+
+    This is a simple geometric approximation, not a perspective-correct
+    reconstruction - it assumes the 4 positions roughly form a parallelogram,
+    which holds well enough for near-overhead photos of a quadrat/marker
+    layout. It is only reliable as a last resort when exactly 3 of 4
+    positions are already known; with 2 or fewer, there isn't enough
+    geometry to constrain a guess, so callers should not invoke this then.
+
+    Parameters:
+    -----------
+    known_points : np.ndarray
+        (3, 2) float32 array of known (x, y) positions.
+    image_shape : tuple[int, int]
+        (H, W) of the image the points are in.
+
+    Returns:
+    --------
+    np.ndarray | None
+        (2,) float32 imputed (x, y) position, or None if known_points does
+        not contain exactly 3 points.
+    """
+    known_points = np.asarray(known_points, dtype=np.float32).reshape(-1, 2)
+    if len(known_points) != 3:
+        return None
+
+    corners = _canonical_corners(image_shape)
+    corner_idx, open_idx = _match_points_to_corners(known_points, corners)
+    missing_idx = int(open_idx[0])
+
+    prev_idx = (missing_idx - 1) % 4
+    next_idx = (missing_idx + 1) % 4
+    opp_idx = (missing_idx + 2) % 4
+
+    prev_pt = known_points[np.where(corner_idx == prev_idx)[0][0]]
+    next_pt = known_points[np.where(corner_idx == next_idx)[0][0]]
+    opp_pt = known_points[np.where(corner_idx == opp_idx)[0][0]]
+
+    return (prev_pt + next_pt - opp_pt).astype(np.float32)
+
+
 def find_marker_midpoints_from_mask(
     class_map: np.ndarray,
     marker_cls_idx: int,
@@ -389,6 +601,7 @@ def find_marker_midpoints_from_mask(
     n_missing: int,
     min_contour_area: int = 300,
     detected_bboxes: np.ndarray | None = None,
+    close_kernel_size: int = 9,
 ) -> np.ndarray:
     """
     Recover up to n_missing marker positions from the segmentation class map.
@@ -396,17 +609,22 @@ def find_marker_midpoints_from_mask(
     Algorithm:
     ----------
       1. Threshold the marker class to get a binary mask.
-      2. Find external contours; compute each centroid via image moments.
-      3. Discard any contour whose own bounding rect is mostly contained within
+      2. Morphologically close the mask (dilate then erode) so that a single
+         marker whose mask is split into separate fragments - e.g. a blade of
+         grass occluding part of it - is coalesced back into one contour
+         before contour extraction.
+      3. Find external contours; compute each centroid via image moments.
+      4. Discard any contour whose own bounding rect is mostly contained within
          an already-detected bounding box (handles a single detection whose mask
          splits into multiple contours, e.g. a marker segmented as two blobs,
          without discarding a separate, genuinely undetected marker that merely
          grazes the edge of a nearby detection's box).
-      4. If detections exist, use linear sum assignment to match them to the
-         nearest remaining contours, then exclude those matched contours too.
-      5. From what's left, greedily select the n_missing centroids that
-         maximise the minimum distance to all already-selected points
-         (detected + previously recovered).
+      5. Match the already-detected midpoints to the image's 4 canonical
+         corners (TL/TR/BR/BL) via Hungarian assignment to find which corner
+         slots are still open, then Hungarian-match the remaining candidate
+         contours to those open corner slots by distance. This picks the
+         candidate that best corresponds to *which* marker is missing, rather
+         than just the one farthest from what's already selected.
 
     Parameters:
     -----------
@@ -425,20 +643,28 @@ def find_marker_midpoints_from_mask(
         (K, 4) float32 array of already-detected (x1, y1, x2, y2)
         boxes, used to discard contours already covered by a
         real detection. Optional.
+    close_kernel_size : int
+        Side length of the square structuring element used to morphologically
+        close the marker mask before contour extraction. Pass 0 to disable.
 
     Returns:
     --------
-    np.ndarray : 
+    np.ndarray :
         (M, 2) float32 array of recovered (x, y) positions, M <= n_missing.
     """
     if marker_cls_idx < 0 or n_missing <= 0:
         return np.empty((0, 2), dtype=np.float32)
 
     marker_mask = (class_map == marker_cls_idx).astype(np.uint8) * 255
+
+    if close_kernel_size > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_kernel_size, close_kernel_size))
+        marker_mask = cv2.morphologyEx(marker_mask, cv2.MORPH_CLOSE, kernel)
+
     contours, _ = cv2.findContours(marker_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # Compute (area, centroid, bounding rect) for valid contours
-    valid: list[tuple[float, np.ndarray, np.ndarray]] = []
+    # Compute (centroid, bounding rect) for valid contours
+    valid: list[tuple[np.ndarray, np.ndarray]] = []
     for c in contours:
         area = cv2.contourArea(c)
         if area < min_contour_area:
@@ -453,16 +679,14 @@ def find_marker_midpoints_from_mask(
         rx, ry, rw, rh = cv2.boundingRect(c)
         rect = np.array([rx, ry, rx + rw, ry + rh], dtype=np.float32)
         valid.append(
-            (area, np.array([cx, cy], dtype=np.float32), rect)
+            (np.array([cx, cy], dtype=np.float32), rect)
         )
 
     if not valid:
         return np.empty((0, 2), dtype=np.float32)
 
-    # Sort largest-first so the greedy pass prefers prominent markers
-    valid.sort(key=lambda x: x[0], reverse=True)
-    centroids = np.array([v[1] for v in valid], dtype=np.float32)  # [M, 2]
-    rects = np.array([v[2] for v in valid], dtype=np.float32)      # [M, 4]
+    centroids = np.array([v[0] for v in valid], dtype=np.float32)  # [M, 2]
+    rects = np.array([v[1] for v in valid], dtype=np.float32)      # [M, 4]
 
     # Drop contours already covered by a real detection's bounding box. This is the
     # sole exclusion mechanism - a forced nearest-neighbor match against `detected`
@@ -474,29 +698,24 @@ def find_marker_midpoints_from_mask(
         return np.empty((0, 2), dtype=np.float32)
 
     detected = np.asarray(detected_midpoints, dtype=np.float32).reshape(-1, 2)
-    candidates = list(centroids)
-    if not candidates:
+
+    # Figure out which of the 4 canonical corner slots are still unfilled by a
+    # real detection, then Hungarian-match remaining candidate contours to
+    # those open slots by distance. linear_sum_assignment naturally caps the
+    # number of matches at min(len(centroids), len(open_corners)) == the
+    # number still needed, so no separate top-n selection is required.
+    corners = _canonical_corners(class_map.shape[:2])
+    _, open_corner_idx = _match_points_to_corners(detected, corners)
+    open_corner_idx = open_corner_idx[:n_missing]
+
+    if len(open_corner_idx) == 0:
         return np.empty((0, 2), dtype=np.float32)
 
-    # Greedy max-min-distance selection to favour well-spread-out points
-    anchor_pts = list(detected) if len(detected) > 0 else []
-    recovered: list[np.ndarray] = []
+    cost = cdist(centroids, corners[open_corner_idx])
+    cand_idx, _ = linear_sum_assignment(cost)
 
-    for _ in range(min(n_missing, len(candidates))):
-        if not anchor_pts:
-            chosen = candidates.pop(0)
-        else:
-            anchor_arr = np.array(anchor_pts, dtype=np.float32)
-            min_dists = np.array([
-                np.min(np.linalg.norm(anchor_arr - pt, axis=1))
-                for pt in candidates
-            ])
-            best = int(np.argmax(min_dists))
-            chosen = candidates.pop(best)
-        recovered.append(chosen)
-        anchor_pts.append(chosen)
-
-    return np.array(recovered, dtype=np.float32) if recovered else np.empty((0, 2), dtype=np.float32)
+    recovered = centroids[cand_idx]
+    return recovered.astype(np.float32)
 
 
 def find_quadrat_corners_from_mask(

@@ -207,3 +207,7 @@ marimo/_lsp/
 __marimo__/
 .claude
 .venv_test
+
+# Local credentials and generated test artifacts
+secrets
+test_output/
